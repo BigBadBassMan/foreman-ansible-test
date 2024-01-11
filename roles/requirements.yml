@@ -1,0 +1,7 @@
+collections:
+  - debops.debops
+
+roles:
+  - name: buluma.service
+  - name: singleplatform-eng.users
+  - name: systemli.apt_repositories
