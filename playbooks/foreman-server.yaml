@@ -1,0 +1,269 @@
+---
+- name: prepare foreman installation
+  gather_facts: true
+  hosts: all
+  tasks:
+    - name: set hostname
+      ansible.builtin.hostname:
+        name: da-testing-foreman-01.reda.cloud
+        use: systemd
+    - name: install saltstack gpg key
+      ansible.builtin.rpm_key:
+        key: https://repo.saltproject.io/salt/py3/redhat/8/x86_64/SALT-PROJECT-GPG-PUBKEY-2023.pub
+        state: present
+    - name: install foreman gpg key
+      ansible.builtin.rpm_key:
+        key: https://yum.theforeman.org/releases/3.9/RPM-GPG-KEY-foreman
+        state: present
+    - name: install puppet gpg key
+      ansible.builtin.rpm_key:
+        key: https://yum.puppetlabs.com/RPM-GPG-KEY-puppet-20250406
+        state: present
+    - name: "Enable AlmaLinux PowerTools repo"
+      community.general.ini_file:
+        path:       /etc/yum.repos.d/almalinux-powertools.repo
+        section:    powertools
+        option:     enabled
+        value:      1
+        create:     no
+      when: ansible_distribution == "AlmaLinux"
+    - name: install basic packages
+      ansible.builtin.dnf:
+        state: latest
+        name:
+          - bind-utils
+          - git
+          - iputils
+          - epel-release
+          - vim
+    - name: install salt 3006.x repo
+      ansible.builtin.yum_repository:
+        baseurl: https://repo.saltproject.io/salt/py3/redhat/8/x86_64/3006
+        description: Salt repo for EL8 PY3
+        enabled: true
+        file: salt-3006
+        gpgcheck: true
+        gpgkey: https://repo.saltproject.io/salt/py3/redhat/8/x86_64/SALT-PROJECT-GPG-PUBKEY-2023.pub
+        name: salt-3006-el8
+        priority: 10
+        skip_if_unavailable: true
+        state: present
+    - name: update packages
+      ansible.builtin.dnf:
+        state: latest
+        update_only: true
+    - name: install foreman-release
+      ansible.builtin.dnf:
+        name: https://yum.theforeman.org/releases/3.9/el8/x86_64/foreman-release.rpm
+        state: present
+    - name: install katello-release
+      ansible.builtin.dnf:
+        name: https://yum.theforeman.org/katello/4.11/katello/el8/x86_64/katello-repos-latest.rpm
+        state: present
+    - name: install config managers
+      ansible.builtin.dnf:
+        name:
+        - https://yum.puppet.com/puppet7-release-el-8.noarch.rpm
+        - ansible
+        - salt-master
+        - salt-minion
+        - salt-ssh
+        - salt-syndic
+        - salt-api
+        - salt-cloud
+        state: present
+    - name: enable katello module
+      shell: dnf module enable katello:el8 --assumeyes
+
+- name: helper services
+  gather_facts: true
+  hosts: all
+  tasks:
+    - name: install packages
+      ansible.builtin.dnf:
+        name:
+          - fapolicyd
+          - chrony
+        state: present
+    - name: enable fapolicyd
+      ansible.builtin.systemd_service:
+        name: fapolicyd
+        state: started
+        enabled: true
+    - name: enable chronyd
+      ansible.builtin.systemd_service:
+        name: chronyd
+        state: started
+        enabled: true
+
+- name: install foreman & katello
+  gather_facts: true
+  hosts: all
+  tasks:
+    - name: update packages
+      ansible.builtin.dnf:
+        state: latest
+        update_only: true
+    - name: install foreman-installer
+      ansible.builtin.dnf:
+        state: latest
+        name: foreman-installer-katello
+    - name: collect service facts
+      ansible.builtin.service_facts:
+    - name: install foreman & katello
+      ansible.builtin.shell:
+        cmd: |
+          foreman-installer --scenario katello \
+          --foreman-initial-organization "REDA" \
+          --foreman-initial-location "Hetzner Cloud" \
+          --foreman-initial-admin-username admin \
+          --enable-foreman-plugin-ansible --enable-foreman-proxy-plugin-ansible \
+          --enable-foreman-plugin-salt --enable-foreman-proxy-plugin-salt \
+          --foreman-proxy-plugin-salt-api=true --foreman-proxy-plugin-salt-api-url "https://localhost:9191"\
+          --enable-foreman-plugin-bootdisk \
+          --enable-foreman-plugin-default-hostgroup \
+          --enable-foreman-plugin-dhcp-browser \
+          --enable-foreman-plugin-discovery \
+          --enable-foreman-plugin-remote-execution \
+          --enable-foreman-plugin-statistics \
+          --enable-foreman-plugin-templates \
+          --enable-foreman-proxy \
+          --foreman-proxy-tftp=true \
+          --foreman-proxy-tftp-servername="10.199.0.2" \
+          --foreman-proxy-dhcp=true \
+          --foreman-proxy-dhcp-interface="ens10" \
+          --foreman-proxy-dhcp-gateway="10.199.0.1" \
+          --foreman-proxy-dhcp-nameservers="10.199.0.2" \
+          --foreman-proxy-dhcp-netmask="255.255.0.0" \
+          --foreman-proxy-dhcp-search-domains="reda.cloud" \
+          --foreman-proxy-dns=true \
+          --foreman-proxy-dns-interface="ens10" \
+          --foreman-proxy-dns-zone="reda.cloud" \
+          --foreman-proxy-dns-reverse="199.10.in-addr.arpa" \
+          --foreman-proxy-dns-forwarders="185.12.64.2"
+
+- name: setup salt environments
+  hosts: all
+  tasks:
+    - name: setup salt environment dirs
+      ansible.builtin.copy:
+        src: ./salt/master.d/environments.conf
+        dest: /etc/salt/master.d/environments.conf
+        owner: root
+        group: salt
+        mode: ug+rwX,o-rwx
+      notify: Restart services
+  handlers:
+    - name: Restart services
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      with_items:
+        - salt-master
+        - salt-api
+
+- name: foreman-salt integration
+  gather_facts: true
+  hosts: all
+  tasks:
+    - name: add sudoers entry
+      ansible.builtin.copy:
+        src: './sudoers/20-foreman-salt'
+        dest: '/etc/sudoers.d'
+        owner: root
+        group: root
+        mode: ug+rwX,o-rwx
+        validate: /usr/sbin/visudo -csf %s
+    - name: 'add salt-api user'
+      ansible.builtin.user:
+        name: saltuser
+        comment: salt-api access from foreman
+        shell: /bin/false
+        expires: -1
+        system: true
+        home: /srv/salt
+        state: present
+    - name: allow salt-user to read foreman-cert for salt-api
+      ansible.posix.acl:
+        path: /etc/foreman-proxy/foreman_ssl_cert.pem
+        entry: "user:salt:r--"
+        state: present
+      notify: Restart services
+    - name: allow salt-user to read foreman-cert-key for salt-api
+      ansible.posix.acl:
+        path: /etc/foreman-proxy/foreman_ssl_key.pem
+        entry: "user:salt:r--"
+        state: present
+      notify: Restart services
+    - name: allow salt-user to read foreman-config for salt-api
+      ansible.posix.acl:
+        path: /etc/salt/master.d/foreman.conf
+        entry: "user:salt:rw-"
+        state: present
+      notify: Restart services
+    - name: create salt autosign file
+      ansible.builtin.file:
+        path: /etc/salt/autosign.conf
+        owner: salt
+        group: foreman-proxy
+        mode: ug+rw,o-rwx
+        state: touch
+    - name: activate foreman-proxy salt-api usage
+      ansible.builtin.lineinfile:
+        line: ':use_api: true'
+        search_string: ':use_api: false'
+        state: present
+        path: /etc/foreman-proxy/settings.d/salt.yml
+      notify: Restart services
+    - name: set foreman-proxy hostname for salt
+      ansible.builtin.lineinfile:
+        line: ':host: da-testing-foreman-01.reda.cloud'
+        search_string: ':host:'
+        state: present
+        path: /etc/salt/foreman.yaml
+      notify: Restart services
+    - name: set foreman-proxy ssl-ca for salt
+      ansible.builtin.lineinfile:
+        line: ':ssl_ca: /etc/foreman-proxy/foreman_ssl_ca.pem'
+        search_string: ':ssl_ca:'
+        state: present
+        path: /etc/salt/foreman.yaml
+      notify: Restart services
+    - name: set foreman-proxy ssl-cert for salt
+      ansible.builtin.lineinfile:
+        line: ':ssl_ca: /etc/foreman-proxy/foreman_ssl_cert.pem'
+        search_string: ':ssl_cert:'
+        state: present
+        path: /etc/salt/foreman.yaml
+      notify: Restart services
+    - name: set foreman-proxy ssl-key for salt
+      ansible.builtin.lineinfile:
+        line: ':ssl_ca: /etc/foreman-proxy/foreman_ssl_key.pem'
+        search_string: ':ssl_key:'
+        state: present
+        path: /etc/salt/foreman.yaml
+      notify: Restart services
+    - name: set salt-api url for foreman-proxy
+      ansible.builtin.lineinfile:
+        line: ':api_url: https://localhost:9191'
+        search_string: ':api_url: https://localhost:8080'
+        state: present
+        path: /etc/foreman-proxy/settings.d/salt.yml
+      notify: Restart services
+    - name: allow foreman-proxy to use salt-runners
+      ansible.builtin.lineinfile:
+        path: /etc/salt/master
+        line: 'netapi_enable_clients: [runner]'
+        search_string: 'netapi_enable_clients: []'
+        state: present
+      notify: Restart services
+  handlers:
+    - name: Restart services
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      with_items:
+        - foreman
+        - foreman-proxy
+        - salt-master
+        - salt-api
